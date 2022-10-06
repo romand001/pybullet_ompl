@@ -16,6 +16,8 @@ except ImportError:
 import pybullet as p
 import utils
 import time
+import math
+from simple_pid import PID
 from itertools import product
 import copy
 
@@ -90,6 +92,87 @@ class PbOMPLRobot():
         for joint, value in zip(joints, positions):
             p.resetJointState(self.id, joint, value, targetVelocity=0)
 
+class Turtlebot(PbOMPLRobot):
+
+    def __init__(self, id) -> None:
+        # Public attributes
+        self.id = id
+
+        # prune fixed joints
+        all_joint_num = p.getNumJoints(id)
+        all_joint_idx = list(range(all_joint_num))
+        joint_idx = [j for j in all_joint_idx if self._is_not_fixed(j)]
+        self.num_dim = len(joint_idx)
+        self.joint_idx = joint_idx
+        print(self.joint_idx)
+        self.joint_bounds = []
+
+        self.pos = [0, 0]
+
+        # initialize PID to bring yaw error down to zero
+        self.pid_yaw = PID(20.0, 0.0, 0.0, setpoint=0)
+
+        self.reset()
+
+    def get_cur_pos(self):
+        return self.pos
+
+    def smallest_signed_angle(self, x, y):
+        a = (x - y) % (2 * math.pi)
+        b = (y - x) % (2 * math.pi)
+        return -a if a < b else b
+    
+    def track_goal(self, goal_xy):
+        goal_x, goal_y = goal_xy
+
+        cur_pos, cur_quat = p.getBasePositionAndOrientation(self.id)
+        cur_orient = p.getEulerFromQuaternion(cur_quat)
+        x = cur_pos[0]
+        y = cur_pos[1]
+        yaw = cur_orient[2]
+
+        self.pos = [x, y]
+
+        dx = goal_x - x
+        dy = goal_y - y
+        dist_err = math.sqrt(dx**2 + dy**2)
+        # yaw_err = math.atan2(dy, dx) - yaw
+        yaw_err = self.smallest_signed_angle(math.atan2(dy, dx), yaw)
+
+        # mean wheel speed in rot/s
+        min_speed = 0.0
+        max_speed = 5.0
+        move_angle = math.radians(10)
+        mean_wheel_speed = max_speed - min(abs(yaw_err), move_angle) / move_angle * (max_speed - min_speed)
+        mean_wheel_speed *= 2 * math.pi
+
+        # compute difference in speed between right wheel and left wheel
+        d_speed = self.pid_yaw(yaw_err)
+        l_speed = mean_wheel_speed - d_speed
+        r_speed = mean_wheel_speed + d_speed
+
+        # print(
+        #     f'cur_pos: ({x:.2f}, {y:.2f}, {yaw:.2f}),\tgoal_pos: ({goal_x:.2f}, {goal_y:.2f}),\tyaw_err: {yaw_err:.2f},\t'
+        #     f'l_speed: {l_speed:.2f},\tr_speed: {r_speed:.2f}'
+        # )
+
+        # send speed commands
+        p.setJointMotorControl2(
+            self.id, 
+            self.joint_idx[0],
+            targetVelocity=l_speed,
+            controlMode=p.VELOCITY_CONTROL,
+            force=500
+        )
+        p.setJointMotorControl2(
+            self.id, 
+            self.joint_idx[1],
+            targetVelocity=r_speed,
+            controlMode=p.VELOCITY_CONTROL,
+            force=500
+        )
+
+
 class PbStateSpace(ob.RealVectorStateSpace):
     def __init__(self, num_dim) -> None:
         super().__init__(num_dim)
@@ -122,16 +205,16 @@ class PbOMPL():
         '''
         self.robot = robot
         self.robot_id = robot.id
+        self.path_ids = []
+        self.point_id = -1
         self.obstacles = obstacles
         print(self.obstacles)
 
-        self.space = PbStateSpace(robot.num_dim)
-
-        bounds = ob.RealVectorBounds(robot.num_dim)
-        joint_bounds = self.robot.get_joint_bounds()
-        for i, bound in enumerate(joint_bounds):
-            bounds.setLow(i, bound[0])
-            bounds.setHigh(i, bound[1])
+        self.space = PbStateSpace(2)
+        bounds = ob.RealVectorBounds(2)
+        for i in range(2):
+            bounds.setLow(i, -5.5)
+            bounds.setHigh(i, 5.5)
         self.space.setBounds(bounds)
 
         self.ss = og.SimpleSetup(self.space)
@@ -143,6 +226,39 @@ class PbOMPL():
 
         self.set_obstacles(obstacles)
         self.set_planner("RRT") # RRT by default
+
+    def draw_path(self, path):
+
+        add_z = lambda xy : [xy[0], xy[1], 0.02]
+
+        for path_id in self.path_ids:
+            p.removeUserDebugItem(path_id)
+        
+        self.path_ids = []
+
+        for idx in range(len(path)-1):
+            self.path_ids.append(
+                p.addUserDebugLine(
+                    lineFromXYZ=add_z(path[idx]), 
+                    lineToXYZ=add_z(path[idx+1]), 
+                    lineColorRGB=[1,0,0],
+                    lineWidth=2,
+                    lifeTime=0
+                )
+            )
+
+    def draw_point(self, point):
+
+        add_z = lambda xy : [xy[0], xy[1], 0.02]
+
+        if self.point_id != -1:
+            p.removeUserDebugItem(self.point_id)
+
+        p.addUserDebugPoints(
+            pointPositions=[add_z(point)],
+            pointColorsRGB=[[0,1,0]],
+            pointSize=5
+        )
 
     def set_obstacles(self, obstacles):
         self.obstacles = obstacles
@@ -157,29 +273,24 @@ class PbOMPL():
         self.obstacles.remove(obstacle_id)
 
     def is_state_valid(self, state):
-        # satisfy bounds TODO
-        # Should be unecessary if joint bounds is properly set
 
-        # check self-collision
-        self.robot.set_state(self.state_to_list(state))
-        for link1, link2 in self.check_link_pairs:
-            if utils.pairwise_link_collision(self.robot_id, link1, self.robot_id, link2):
-                # print(get_body_name(body), get_link_name(body, link1), get_link_name(body, link2))
+        # bounding box of turtlebot
+        aabb_min = [state[0]-0.18, state[1]-0.18, 0]
+        aabb_max = [state[0]+0.18, state[1]+0.18, 0.42]
+
+        overlap_ids = p.getOverlappingObjects(aabb_min, aabb_max)
+
+        for overlap_id in overlap_ids:
+            if overlap_id[0] in self.obstacles:
                 return False
 
-        # check collision against environment
-        for body1, body2 in self.check_body_pairs:
-            if utils.pairwise_collision(body1, body2):
-                # print('body collision', body1, body2)
-                # print(get_body_name(body1), get_body_name(body2))
-                return False
         return True
 
     def setup_collision_detection(self, robot, obstacles, self_collisions = True, allow_collision_links = []):
-        self.check_link_pairs = utils.get_self_link_pairs(robot.id, robot.joint_idx) if self_collisions else []
-        moving_links = frozenset(
-            [item for item in utils.get_moving_links(robot.id, robot.joint_idx) if not item in allow_collision_links])
-        moving_bodies = [(robot.id, moving_links)]
+        # self.check_link_pairs = utils.get_self_link_pairs(robot.id, robot.joint_idx) if self_collisions else []
+        all_links = frozenset(
+            [item for item in utils.get_all_links(robot.id) if not item in allow_collision_links])
+        moving_bodies = [(robot.id, all_links)]
         self.check_body_pairs = list(product(moving_bodies, obstacles))
 
     def set_planner(self, planner_name):
@@ -200,6 +311,8 @@ class PbOMPL():
             self.planner = og.FMT(self.ss.getSpaceInformation())
         elif planner_name == "BITstar":
             self.planner = og.BITstar(self.ss.getSpaceInformation())
+        elif planner_name == "DRRT":
+            self.planner = og.DRRT(self.ss.getSpaceInformation())
         else:
             print("{} not recognized, please add it first".format(planner_name))
             return
@@ -208,7 +321,7 @@ class PbOMPL():
 
     def plan_start_goal(self, start, goal, allowed_time = DEFAULT_PLANNING_TIME):
         '''
-        plan a path to gaol from the given robot start state
+        plan a path to goal from the given robot start state
         '''
         print("start_planning")
         print(self.planner.params())
@@ -229,10 +342,10 @@ class PbOMPL():
         res = False
         sol_path_list = []
         if solved:
-            print("Found solution: interpolating into {} segments".format(INTERPOLATE_NUM))
+            # print("Found solution: interpolating into {} segments".format(INTERPOLATE_NUM))
             # print the path to screen
             sol_path_geometric = self.ss.getSolutionPath()
-            sol_path_geometric.interpolate(INTERPOLATE_NUM)
+            # sol_path_geometric.interpolate(INTERPOLATE_NUM)
             sol_path_states = sol_path_geometric.getStates()
             sol_path_list = [self.state_to_list(state) for state in sol_path_states]
             # print(len(sol_path_list))
@@ -251,7 +364,8 @@ class PbOMPL():
         '''
         plan a path to gaol from current robot state
         '''
-        start = self.robot.get_cur_state()
+        cur_pos, _ = p.getBasePositionAndOrientation(self.robot_id)
+        start = cur_pos[:2]
         return self.plan_start_goal(start, goal, allowed_time=allowed_time)
 
     def execute(self, path, dynamics=False):
@@ -271,6 +385,17 @@ class PbOMPL():
                 self.robot.set_state(q)
             p.stepSimulation()
             time.sleep(0.01)
+
+    def execute_step(self, goal_pos):
+        '''
+        Execute a planned plan. Will visualize in pybullet.
+        Args:
+            goal_pos: x and y of goal state
+        '''
+
+        self.robot.track_goal(goal_pos)
+        p.stepSimulation()
+        time.sleep(0.01)
 
 
 
